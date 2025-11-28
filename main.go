@@ -10,13 +10,14 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 )
 
 const (
 	DATABASE_FILE = "sites.json"
 	HTTP_TIMEOUT  = 30 * time.Second
-	MAX_WORKERS   = 10
+	MAX_WORKERS   = 50
 )
 
 type FeedType int
@@ -65,6 +66,13 @@ type FeedResult struct {
 	Title      string
 	LatestLink string
 	FeedType   FeedType
+	Error      error
+}
+
+type CheckResult struct {
+	SiteName string
+	Site     Site
+	Result   *FeedResult
 }
 
 func detectFeedType(body []byte) FeedType {
@@ -240,7 +248,8 @@ func addSiteMode(sites SiteData) error {
 		}
 
 		fmt.Printf("Testing feed... ")
-		resp, err := http.Get(siteRSSURL)
+		client := &http.Client{Timeout: HTTP_TIMEOUT}
+		resp, err := client.Get(siteRSSURL)
 		if err != nil {
 			fmt.Printf("FAILED: %v\n", err)
 			fmt.Print("Do you want to save anyway? (y/n): ")
@@ -282,33 +291,110 @@ func addSiteMode(sites SiteData) error {
 	return nil
 }
 
+func checkSingleFeed(siteName string, site Site, results chan<- CheckResult, wg *sync.WaitGroup) {
+	defer wg.Done()
+
+	client := &http.Client{Timeout: HTTP_TIMEOUT}
+
+	start := time.Now()
+	resp, err := client.Get(site.RSSUrl)
+	if err != nil {
+		if strings.Contains(err.Error(), "timeout") || strings.Contains(err.Error(), "deadline") {
+			results <- CheckResult{
+				SiteName: siteName,
+				Site:     site,
+				Result: &FeedResult{
+					Error: fmt.Errorf("timeout exceeded after %v", HTTP_TIMEOUT),
+				},
+			}
+			return
+		}
+
+		results <- CheckResult{
+			SiteName: siteName,
+			Site:     site,
+			Result: &FeedResult{
+				Error: fmt.Errorf("URL fetch error: %w", err),
+			},
+		}
+		return
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		results <- CheckResult{
+			SiteName: siteName,
+			Site:     site,
+			Result: &FeedResult{
+				Error: fmt.Errorf("error reading response: %w", err),
+			},
+		}
+		return
+	}
+
+	feedResult, err := parseFeed(body)
+	if err != nil {
+		results <- CheckResult{
+			SiteName: siteName,
+			Site:     site,
+			Result: &FeedResult{
+				Error: fmt.Errorf("parse error: %w", err),
+			},
+		}
+		return
+	}
+
+	elapsed := time.Since(start)
+	if feedResult.LatestLink == "" {
+		feedResult.Error = fmt.Errorf("no entries found (%s) - checked in %v", feedTypeString(feedResult.FeedType), elapsed)
+	} else {
+		feedResult.Error = nil
+	}
+
+	results <- CheckResult{
+		SiteName: siteName,
+		Site:     site,
+		Result:   feedResult,
+	}
+}
+
 func checkFeeds(sites SiteData) error {
+	var wg sync.WaitGroup
+	results := make(chan CheckResult, len(sites))
+
+	sem := make(chan struct{}, MAX_WORKERS)
+
 	hasUpdates := false
 
 	for name, site := range sites {
-		fmt.Printf("Checking %s... ", name)
+		wg.Add(1)
+		sem <- struct{}{}
 
-		resp, err := http.Get(site.RSSUrl)
-		if err != nil {
-			fmt.Printf("URL fetch error: %v\n", err)
-			continue
-		}
-		defer resp.Body.Close()
+		go func(siteName string, site Site) {
+			defer func() { <-sem }()
+			checkSingleFeed(siteName, site, results, &wg)
+		}(name, site)
+	}
 
-		body, err := io.ReadAll(resp.Body)
-		if err != nil {
-			fmt.Printf("Error reading response: %v\n", err)
-			continue
-		}
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
 
-		feedResult, err := parseFeed(body)
-		if err != nil {
-			fmt.Printf("Parse error: %v\n", err)
-			continue
-		}
+	for result := range results {
+		siteName := result.SiteName
+		site := result.Site
+		feedResult := result.Result
 
-		if feedResult.LatestLink == "" {
-			fmt.Printf("no entries found (%s)\n", feedTypeString(feedResult.FeedType))
+		if feedResult.Error != nil {
+			if strings.Contains(feedResult.Error.Error(), "timeout exceeded") {
+				fmt.Printf("%s → TIMEOUT: %v\n", siteName, feedResult.Error)
+			} else if strings.Contains(feedResult.Error.Error(), "no entries found") {
+				fmt.Printf("%s → %v\n", siteName, feedResult.Error)
+			} else {
+				fmt.Printf("%s → ERROR: %v\n", siteName, feedResult.Error)
+			}
 			continue
 		}
 
@@ -316,9 +402,9 @@ func checkFeeds(sites SiteData) error {
 
 		switch {
 		case savedLink == "":
-			fmt.Printf("first time checking (%s)\n", feedTypeString(feedResult.FeedType))
+			fmt.Printf("%s → First time checking (%s)\n", siteName, feedTypeString(feedResult.FeedType))
 			site.LatestEntry = feedResult.LatestLink
-			sites[name] = site
+			sites[siteName] = site
 			hasUpdates = true
 
 		case feedResult.LatestLink != savedLink:
@@ -326,13 +412,13 @@ func checkFeeds(sites SiteData) error {
 			if title == "" {
 				title = "Untitled"
 			}
-			fmt.Printf("NEW ENTRY: %s - %s (%s)\n", title, feedResult.LatestLink, feedTypeString(feedResult.FeedType))
+			fmt.Printf("%s → NEW ENTRY: %s - %s (%s)\n", siteName, title, feedResult.LatestLink, feedTypeString(feedResult.FeedType))
 			site.LatestEntry = feedResult.LatestLink
-			sites[name] = site
+			sites[siteName] = site
 			hasUpdates = true
 
 		default:
-			fmt.Printf("no new entries (%s)\n", feedTypeString(feedResult.FeedType))
+			fmt.Printf("(-_-) %s\n", siteName)
 		}
 	}
 
@@ -366,6 +452,9 @@ func main() {
 			fmt.Println("No sites configured. Use -a to add sites.")
 			return
 		}
+
+		fmt.Printf("Checking %d sites concurrently (timeout: %v, max workers: %d)...\n\n",
+			len(sites), HTTP_TIMEOUT, MAX_WORKERS)
 
 		if err := checkFeeds(sites); err != nil {
 			fmt.Printf("Error checking feeds: %v\n", err)
