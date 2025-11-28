@@ -366,6 +366,7 @@ func checkFeeds(sites SiteData) error {
 	sem := make(chan struct{}, MAX_WORKERS)
 
 	hasUpdates := false
+	index := 1
 
 	for name, site := range sites {
 		wg.Add(1)
@@ -402,7 +403,7 @@ func checkFeeds(sites SiteData) error {
 
 		switch {
 		case savedLink == "":
-			fmt.Printf("%s → First time checking (%s)\n", siteName, feedTypeString(feedResult.FeedType))
+			fmt.Printf("%d. %s → First time checking (%s)\n", index, siteName, feedTypeString(feedResult.FeedType))
 			site.LatestEntry = feedResult.LatestLink
 			sites[siteName] = site
 			hasUpdates = true
@@ -412,14 +413,16 @@ func checkFeeds(sites SiteData) error {
 			if title == "" {
 				title = "Untitled"
 			}
-			fmt.Printf("%s → NEW ENTRY: %s - %s (%s)\n", siteName, title, feedResult.LatestLink, feedTypeString(feedResult.FeedType))
+			fmt.Printf("%d. %s → NEW ENTRY: %s - %s (%s)\n", index, siteName, title, feedResult.LatestLink, feedTypeString(feedResult.FeedType))
 			site.LatestEntry = feedResult.LatestLink
 			sites[siteName] = site
 			hasUpdates = true
 
 		default:
-			fmt.Printf("(-_-) %s\n", siteName)
+			fmt.Printf("%d. (-_-) %s\n", index, siteName)
 		}
+
+		index++
 	}
 
 	if hasUpdates {
