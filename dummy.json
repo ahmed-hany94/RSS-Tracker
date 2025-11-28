@@ -1,0 +1,6 @@
+{
+  "Site Title": {
+    "rss_url": "https://<site>/index.xml",
+    "latest_entry": "..."
+  }
+}
